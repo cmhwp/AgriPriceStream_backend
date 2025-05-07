@@ -19,7 +19,7 @@ scheduler = AsyncIOScheduler()
 
 async def crawl_latest_data():
     """
-    爬取最新的数据（当天或数据库中不存在的最新日期）
+    爬取最新的数据（从数据库中最新记录日期到当前日期的数据）
     """
     logger.info("开始执行自动爬取任务...")
     
@@ -38,43 +38,28 @@ async def crawl_latest_data():
         
         # 如果没有记录或最新记录不是今天，则爬取最新数据
         if not latest_date or latest_date.date() < current_date:
-            # 获取第一页数据（通常包含最新数据）
-            page_data = fetch_data(page_num=1, page_size=100, kind=1)
+            # 确定爬取的开始日期
+            start_date = latest_date.date() + timedelta(days=1) if latest_date else current_date - timedelta(days=30)
             
-            if not page_data:
-                logger.error("无法获取最新数据")
-                return
+            # 使用crawl_historical_data函数爬取从最新记录日期到当前日期的所有数据
+            logger.info(f"开始爬取从 {start_date} 到 {current_date} 的数据")
             
-            total_processed = 0
-            new_date_found = False
+            # 关闭当前数据库会话，因为crawl_historical_data会创建自己的会话
+            db.close()
             
-            # 处理获取的数据
-            for item in page_data.get("rows", []):
-                try:
-                    # 解析日期
-                    from dateutil.parser import parse
-                    item_date = parse(item.get("priceDate")).date()
-                    
-                    # 仅处理比数据库最新日期更新的数据
-                    if not latest_date or item_date > latest_date.date():
-                        if save_vegetable_data(db, item):
-                            total_processed += 1
-                            new_date_found = True
-                            logger.info(f"保存了新数据: {item.get('productName')} 在 {item_date}")
-                except Exception as e:
-                    logger.error(f"处理数据项时出错: {str(e)}")
+            # 调用crawl_historical_data爬取数据
+            crawl_historical_data(start_date, current_date)
             
-            if new_date_found:
-                logger.info(f"成功爬取并保存了 {total_processed} 条新数据")
-            else:
-                logger.info("没有发现新数据")
+            logger.info(f"成功爬取了从 {start_date} 到 {current_date} 的数据")
         else:
             logger.info("数据库已包含最新日期的数据，无需爬取")
+            db.close()
     
     except Exception as e:
         logger.error(f"自动爬取过程中出错: {str(e)}")
+        if db:
+            db.close()
     finally:
-        db.close()
         logger.info("自动爬取任务完成")
 
 def start_scheduler():
@@ -143,8 +128,7 @@ async def run_crawler_once():
             db.close()
     
     try:
-        # 调用crawl_latest_data而不是crawl_historical_data
-        # 这样会智能地爬取从数据库中最新日期到当前日期的数据
+        # 调用crawl_latest_data爬取从数据库中最新日期到当前日期的数据
         await crawl_latest_data()
         logger.info("爬虫任务完成")
         

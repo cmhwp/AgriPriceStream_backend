@@ -171,10 +171,12 @@ def get_vegetables_by_price_range(
     db: Session,
     min_price: Optional[float] = None,
     max_price: Optional[float] = None,
+    name_filter: Optional[str] = None,
+    kind_filter: Optional[str] = None,
     skip: int = 0,
     limit: int = 100
 ) -> List[Vegetable]:
-    """根据价格范围查询蔬菜"""
+    """根据价格范围查询蔬菜，可同时按名称和种类筛选"""
     query = db.query(Vegetable)
     
     if min_price is not None:
@@ -183,14 +185,24 @@ def get_vegetables_by_price_range(
     if max_price is not None:
         query = query.filter(Vegetable.average_price <= max_price)
     
+    # 应用名称筛选
+    if name_filter:
+        query = query.filter(Vegetable.product_name.like(f"%{name_filter}%"))
+    
+    # 应用种类筛选
+    if kind_filter:
+        query = query.filter(Vegetable.kind == kind_filter)
+    
     return query.order_by(Vegetable.price_date.desc()).offset(skip).limit(limit).all()
 
 def get_vegetables_by_price_range_count(
     db: Session,
     min_price: Optional[float] = None,
-    max_price: Optional[float] = None
+    max_price: Optional[float] = None,
+    name_filter: Optional[str] = None,
+    kind_filter: Optional[str] = None
 ) -> int:
-    """获取价格范围内的蔬菜总数"""
+    """获取价格范围内的蔬菜总数，可同时按名称和种类筛选"""
     query = db.query(func.count(Vegetable.id))
     
     if min_price is not None:
@@ -198,6 +210,14 @@ def get_vegetables_by_price_range_count(
     
     if max_price is not None:
         query = query.filter(Vegetable.average_price <= max_price)
+    
+    # 应用名称筛选
+    if name_filter:
+        query = query.filter(Vegetable.product_name.like(f"%{name_filter}%"))
+    
+    # 应用种类筛选
+    if kind_filter:
+        query = query.filter(Vegetable.kind == kind_filter)
     
     return query.scalar()
 

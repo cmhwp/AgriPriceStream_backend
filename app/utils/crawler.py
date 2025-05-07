@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 from dateutil.parser import parse
 
-from app.models.models import Vegetable, PriceRecord
+from app.models.models import Vegetable, PriceRecord, CrawlerActivity
 from app.db.database import SessionLocal
 
 # 设置日志
@@ -109,7 +109,7 @@ def save_vegetable_data(db: Session, data_item):
         logger.error(f"保存数据时出错: {str(e)}")
         return False
 
-def crawl_historical_data(start_date, end_date=None):
+def crawl_historical_data(start_date, end_date=None, processing_activity_id=None):
     """爬取指定日期范围内的历史数据"""
     if end_date is None:
         end_date = datetime.now().date()
@@ -175,22 +175,57 @@ def crawl_historical_data(start_date, end_date=None):
         try:
             from app.crud.dashboard import create_crawler_activity
             
-            # 确定标题和描述
-            if (end_date - start_date).days > 1:
-                title = f"历史数据爬取 ({start_date} 至 {end_date})"
-                description = f"爬取了{days_to_crawl}天的历史数据，成功获取了{total_processed}条记录"
+            # 如果传入了处理中活动ID，则更新该活动
+            if processing_activity_id:
+                activity = db.query(CrawlerActivity).filter(CrawlerActivity.id == processing_activity_id).first()
+                if activity:
+                    activity.status = status
+                    activity.records_count = total_processed
+                    activity.duration = duration
+                    
+                    # 确定标题和描述
+                    if (end_date - start_date).days > 1:
+                        activity.description = f"爬取了{days_to_crawl}天的历史数据，成功获取了{total_processed}条记录"
+                    else:
+                        activity.description = f"成功获取了{total_processed}条新数据"
+                    
+                    db.commit()
+                    logger.info(f"更新爬虫活动记录，ID: {processing_activity_id}")
+                else:
+                    # 如果找不到处理中的活动，则创建新活动
+                    if (end_date - start_date).days > 1:
+                        title = f"历史数据爬取 ({start_date} 至 {end_date})"
+                        description = f"爬取了{days_to_crawl}天的历史数据，成功获取了{total_processed}条记录"
+                    else:
+                        title = "每日常规爬取"
+                        description = f"成功获取了{total_processed}条新数据"
+                    
+                    create_crawler_activity(
+                        db=db,
+                        title=title,
+                        description=description,
+                        status=status,
+                        records_count=total_processed,
+                        duration=duration
+                    )
             else:
-                title = "每日常规爬取"
-                description = f"成功获取了{total_processed}条新数据"
-            
-            create_crawler_activity(
-                db=db,
-                title=title,
-                description=description,
-                status=status,
-                records_count=total_processed,
-                duration=duration
-            )
+                # 没有处理中活动ID，创建新活动
+                # 确定标题和描述
+                if (end_date - start_date).days > 1:
+                    title = f"历史数据爬取 ({start_date} 至 {end_date})"
+                    description = f"爬取了{days_to_crawl}天的历史数据，成功获取了{total_processed}条记录"
+                else:
+                    title = "每日常规爬取"
+                    description = f"成功获取了{total_processed}条新数据"
+                
+                create_crawler_activity(
+                    db=db,
+                    title=title,
+                    description=description,
+                    status=status,
+                    records_count=total_processed,
+                    duration=duration
+                )
         except Exception as e:
             logger.error(f"记录爬虫活动时出错: {str(e)}")
         
@@ -204,16 +239,38 @@ def crawl_historical_data(start_date, end_date=None):
             end_time = time.time()
             duration = int(end_time - start_time)
             
-            create_crawler_activity(
-                db=db,
-                title="爬虫错误",
-                description=f"爬取数据时发生错误: {str(e)}",
-                status="error",
-                records_count=total_processed,
-                duration=duration
-            )
-        except:
-            pass
+            # 如果传入了处理中活动ID，则更新该活动为错误状态
+            if processing_activity_id:
+                activity = db.query(CrawlerActivity).filter(CrawlerActivity.id == processing_activity_id).first()
+                if activity:
+                    activity.status = "error"
+                    activity.description = f"爬取数据时发生错误: {str(e)}"
+                    activity.records_count = total_processed
+                    activity.duration = duration
+                    db.commit()
+                    logger.info(f"更新爬虫活动为错误状态，ID: {processing_activity_id}")
+                else:
+                    # 如果找不到处理中的活动，则创建新活动
+                    create_crawler_activity(
+                        db=db,
+                        title="爬虫错误",
+                        description=f"爬取数据时发生错误: {str(e)}",
+                        status="error",
+                        records_count=total_processed,
+                        duration=duration
+                    )
+            else:
+                # 没有处理中活动ID，创建新错误活动
+                create_crawler_activity(
+                    db=db,
+                    title="爬虫错误",
+                    description=f"爬取数据时发生错误: {str(e)}",
+                    status="error",
+                    records_count=total_processed,
+                    duration=duration
+                )
+        except Exception as ex:
+            logger.error(f"记录爬虫错误活动时出错: {str(ex)}")
     finally:
         db.close()
 

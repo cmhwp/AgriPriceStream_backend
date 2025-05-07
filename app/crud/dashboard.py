@@ -44,7 +44,6 @@ def get_user_dashboard_data(db: Session, user_id: int) -> Dict[str, Any]:
     if not user:
         return {"error": "未找到用户"}
     
-    # 1. 用户通知数量 - 已移除通知相关功能
     
     # 2. 用户订阅的蔬菜 - 已移除通知相关功能
     subscribed_vegetables = []

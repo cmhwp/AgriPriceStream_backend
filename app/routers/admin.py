@@ -79,13 +79,20 @@ async def admin_run_crawler_once(
 
 @router.post("/crawl/historical", response_model=ResponseModel)
 def admin_crawl_historical_data(
-    start_date: str,
-    end_date: str = None,
+    request_data: dict,
     background_tasks: BackgroundTasks = None,
-    current_user: User = Depends(get_current_admin)
+    current_user: User = Depends(get_current_admin),
+    db: Session = Depends(get_db)
 ):
     """爬取历史数据"""
     try:
+        # 从请求体中获取日期
+        start_date = request_data.get("start_date")
+        end_date = request_data.get("end_date")
+        
+        if not start_date:
+            return response_error(msg="开始日期是必须的", code=400)
+        
         # 解析日期
         start = datetime.strptime(start_date, "%Y-%m-%d").date()
         end = datetime.strptime(end_date, "%Y-%m-%d").date() if end_date else datetime.now().date()
@@ -98,17 +105,46 @@ def admin_crawl_historical_data(
         if (end - start).days > 365:
             return response_error(msg="日期范围不能超过一年", code=400)
         
+        # 检查日期是否在未来
+        today = datetime.now().date()
+        if start > today:
+            return response_error(msg="开始日期不能是未来日期", code=400)
+        if end > today:
+            return response_error(msg="结束日期不能是未来日期", code=400)
+        
+        # 计算需要爬取的天数
+        delta = end - start
+        days_to_crawl = delta.days + 1
+        
+        # 记录爬虫活动状态为"处理中"
+        from app.crud.dashboard import create_crawler_activity
+        title = f"历史数据爬取 ({start} 至 {end})"
+        description = f"正在爬取{days_to_crawl}天的历史数据..."
+        activity = create_crawler_activity(
+            db=db,
+            title=title,
+            description=description,
+            status="processing",
+            records_count=0,
+            duration=0
+        )
+        
+        # 获取活动ID
+        processing_activity_id = activity.id if hasattr(activity, 'id') else None
+        
         # 在后台运行爬虫任务
         if background_tasks:
-            background_tasks.add_task(crawl_historical_data, start, end)
+            background_tasks.add_task(crawl_historical_data, start, end, processing_activity_id)
             return response_success(msg=f"历史数据爬取任务已在后台启动，时间范围：{start} 至 {end}")
         else:
             # 直接运行（会阻塞请求）
-            crawl_historical_data(start, end)
+            crawl_historical_data(start, end, processing_activity_id)
             return response_success(msg=f"历史数据爬取任务已完成，时间范围：{start} 至 {end}")
     
     except ValueError:
         return response_error(msg="日期格式无效，请使用YYYY-MM-DD格式", code=400)
+    except KeyError:
+        return response_error(msg="请求数据格式不正确", code=400)
 
 @router.post("/users/create-admin", response_model=ResponseModel)
 def create_admin_user(
