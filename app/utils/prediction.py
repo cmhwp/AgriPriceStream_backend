@@ -15,7 +15,7 @@ import traceback
 
 from app.models.models import PriceRecord, Vegetable, Prediction, ModelTraining, ModelEvaluation
 from app.crud import predictions as predictions_crud
-from app.schemas.prediction import ModelTrainingCreate, PredictionCreate
+from app.schemas.prediction import ModelTrainingCreate, PredictionCreate, ModelEvaluationCreate
 
 # 配置日志
 logger = logging.getLogger("vegetable_price_prediction")
@@ -417,17 +417,18 @@ def train_lstm_model(
                 accuracy = np.mean(relative_errors < 0.1)  # 相对误差<10%视为准确
                 
                 # 创建评估记录
-                predictions_crud.create_model_evaluation(
-                    db=db,
+                evaluation = ModelEvaluationCreate(
                     model_id=training_id,
                     algorithm="LSTM",
-                        vegetable_id=vegetable_id,
+                    vegetable_id=vegetable_id,
                     product_name=vegetable.product_name,
                     mean_absolute_error=float(mae),
                     mean_squared_error=float(mse),
                     r_squared=float(r2),
                     prediction_accuracy=float(accuracy)
                 )
+                
+                predictions_crud.create_model_evaluation(db=db, evaluation=evaluation)
                 
                 # 更新训练记录日志
                 eval_log = f"\n模型评估结果：\nMAE: {mae:.4f}, MSE: {mse:.4f}, RMSE: {rmse:.4f}\nR²: {r2:.4f}, 准确率: {accuracy*100:.2f}%"
