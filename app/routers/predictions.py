@@ -2,11 +2,13 @@ from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query
 from sqlalchemy.orm import Session
 from typing import List, Optional
 from datetime import datetime
+import re
+import logging
 
-from app.db.database import get_db
+from app.db.database import get_db, get_db_instance
 from app.utils import prediction as prediction_utils
 from app.crud import predictions as predictions_crud
-from app.models.models import Vegetable
+from app.models.models import Vegetable, ModelTraining
 from app.schemas.prediction import (
     PredictionResponse, 
     PredictionResult,
@@ -28,6 +30,9 @@ router = APIRouter(
     responses={404: {"description": "Not found"}},
 )
 
+# 配置日志记录器
+logger = logging.getLogger("vegetable_price_prediction")
+
 @router.post("/train-all-models", response_model=ResponseModel)
 async def train_all_vegetable_models(
     background_tasks: BackgroundTasks,
@@ -46,8 +51,6 @@ async def train_all_vegetable_models(
         try:
             prediction_utils.auto_train_models(db_session)
         except Exception as e:
-            import logging
-            logger = logging.getLogger("api")
             logger.error(f"训练所有模型时出错: {str(e)}")
     
     # 启动后台任务
@@ -91,6 +94,23 @@ async def train_model(
             msg="未找到指定蔬菜"
         )
     
+    # 检查是否已有正在训练的该蔬菜模型
+    existing_training = db.query(ModelTraining).filter(
+        ModelTraining.vegetable_id == vegetable_id,
+        ModelTraining.status.in_(["pending", "running"])
+    ).first()
+    
+    if existing_training:
+        return ResponseModel(
+            data={
+                "training_id": existing_training.id,
+                "status": existing_training.status,
+                "message": "该蔬菜已有正在进行的训练任务"
+            },
+            code=400,
+            msg=f"该蔬菜已有正在进行的训练任务(ID: {existing_training.id})"
+        )
+    
     # 创建训练记录
     training_data = ModelTrainingCreate(
         algorithm=config.algorithm,
@@ -102,20 +122,74 @@ async def train_model(
         smoothing=config.smoothing,
         seasonality=config.seasonality,
         sequence_length=config.sequence_length,
-        start_time=datetime.now()
+        start_time=datetime.now(),
+        log="训练任务已创建，等待启动..."
     )
     
     # 创建训练记录
     training_record = predictions_crud.create_model_training(db, training_data)
     
+    # 定义训练任务包装函数，确保异常被捕获和记录
+    async def train_model_task(vegetable_id: int, db: Session, config: TrainingConfig, training_id: int):
+        try:
+            # 在新的数据库会话中训练模型
+            async_db = get_db_instance()
+            
+            # 使用锁或标记确保任务唯一性
+            # 更新状态为准备中
+            predictions_crud.update_model_training(
+                async_db, training_id, 
+                status="pending",
+                log="准备启动训练..."
+            )
+            
+            # 调用训练函数
+            result = prediction_utils.train_lstm_model(
+                vegetable_id=vegetable_id,
+                db=async_db,
+                sequence_length=config.sequence_length or 60,
+                history_days=config.history_days or 365,
+                prediction_days=config.prediction_days or 7,
+                training_id=training_id
+            )
+            
+            # 检查训练结果
+            if not result.get("success", False):
+                error_msg = result.get("error", "未知错误")
+                logger.error(f"训练失败: {error_msg}")
+                
+                # 更新训练记录失败状态
+                predictions_crud.update_model_training(
+                    async_db, training_id, 
+                    status="failed",
+                    log=f"{predictions_crud.get_model_training(async_db, training_id).log}\n\n训练失败: {error_msg}",
+                    end_time=datetime.now()
+                )
+        except Exception as e:
+            logger.exception(f"训练任务执行异常: {str(e)}")
+            # 确保会话有效
+            try:
+                async_db = get_db_instance()
+                # 更新训练记录为失败状态
+                predictions_crud.update_model_training(
+                    async_db, training_id, 
+                    status="failed",
+                    log=f"{predictions_crud.get_model_training(async_db, training_id).log}\n\n训练执行异常: {str(e)}",
+                    end_time=datetime.now()
+                )
+            except Exception as inner_e:
+                logger.critical(f"无法更新训练记录状态: {str(inner_e)}")
+        finally:
+            # 确保会话关闭
+            if 'async_db' in locals():
+                async_db.close()
+    
     # 在后台任务中训练模型
     background_tasks.add_task(
-        prediction_utils.train_lstm_model,
+        train_model_task,
         vegetable_id=vegetable_id,
         db=db,
-        sequence_length=config.sequence_length or 60,
-        history_days=config.history_days or 365,
-        prediction_days=config.prediction_days or 7,
+        config=config,
         training_id=training_record.id
     )
     
@@ -305,6 +379,60 @@ async def get_training_details(
         data=training_response,
         code=0,
         msg="获取训练详情成功"
+    )
+
+@router.get("/training/{training_id}/status", response_model=ResponseModel)
+async def get_training_status(
+    training_id: int,
+    db: Session = Depends(get_db)
+):
+    """
+    获取特定训练任务的状态信息（轻量级API，用于前端轮询）
+    """
+    training = predictions_crud.get_model_training(db, training_id)
+    if not training:
+        raise HTTPException(status_code=404, detail="训练记录不存在")
+    
+    # 提取进度信息，从日志中解析当前epoch
+    current_epoch = 0
+    total_epochs = 0
+    last_loss = None
+    
+    if training.log:
+        # 从日志中提取进度信息
+        epoch_matches = re.findall(r"Epoch \[(\d+)/(\d+)\]", training.log)
+        if epoch_matches:
+            current_epoch, total_epochs = map(int, epoch_matches[-1])
+        
+        # 提取最新的损失值
+        loss_matches = re.findall(r"Loss: (\d+\.\d+)", training.log)
+        if loss_matches:
+            last_loss = float(loss_matches[-1])
+    
+    # 计算进度百分比
+    progress_percent = 0
+    if total_epochs > 0:
+        progress_percent = min(round((current_epoch / total_epochs) * 100), 100)
+    
+    # 构建轻量级响应
+    status_response = {
+        "id": training.id,
+        "status": training.status,
+        "progress_percent": progress_percent,
+        "current_epoch": current_epoch,
+        "total_epochs": total_epochs,
+        "last_loss": last_loss,
+        "start_time": training.start_time,
+        "end_time": training.end_time,
+        "running_time": (datetime.now() - training.start_time).total_seconds() if training.start_time else 0,
+        "vegetable_id": training.vegetable_id,
+        "product_name": training.product_name
+    }
+    
+    return ResponseModel(
+        data=status_response,
+        code=0,
+        msg="获取训练状态成功"
     )
 
 @router.get("/evaluations", response_model=ResponseModel)

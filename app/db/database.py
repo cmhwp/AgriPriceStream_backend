@@ -18,4 +18,16 @@ def get_db():
     try:
         yield db
     finally:
-        db.close() 
+        db.close()
+
+def get_db_instance():
+    """
+    获取数据库实例（非依赖注入版本，用于后台任务）
+    
+    与get_db不同，这个函数直接返回数据库会话实例，而不是yield。
+    适用于后台任务或异步上下文中创建新的数据库会话。
+    
+    Returns:
+        数据库会话实例
+    """
+    return SessionLocal() 

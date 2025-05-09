@@ -12,6 +12,7 @@ from sklearn.preprocessing import MinMaxScaler
 from torch.utils.data import Dataset, DataLoader
 from sqlalchemy import func
 import traceback
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 
 from app.models.models import PriceRecord, Vegetable, Prediction, ModelTraining, ModelEvaluation
 from app.crud import predictions as predictions_crud
@@ -182,20 +183,22 @@ def train_lstm_model(
     Args:
         vegetable_id: 蔬菜ID
         db: 数据库会话
-        sequence_length: LSTM序列长度 (历史天数)，如果为None则自动设置
-        history_days: 使用多少天的历史数据，如果from_2022为True则被忽略
-        prediction_days: 预测未来多少天的价格
-        training_id: 训练记录ID，如果为None则创建新记录
-        min_data_points: 最小需要的数据点数量
-        from_2022: 是否使用从2022年开始的所有数据
+        sequence_length: 序列长度
+        history_days: 历史数据天数
+        prediction_days: 预测天数
+        training_id: 训练记录ID
+        min_data_points: 最小数据点数
+        from_2022: 是否只使用2022年之后的数据
+        
+    Returns:
+        模型训练结果
     """
-    training_record = None
     try:
         # 记录训练开始
         if training_id:
             training_record = predictions_crud.get_model_training(db, training_id)
             if training_record:
-                predictions_crud.update_model_training(db, training_id, status="running")
+                predictions_crud.update_model_training(db, training_id, status="running", log="初始化训练环境...")
             else:
                 logger.error(f"未找到ID为{training_id}的训练记录")
                 return {"success": False, "error": f"未找到ID为{training_id}的训练记录"}
@@ -204,22 +207,24 @@ def train_lstm_model(
             vegetable = db.query(Vegetable).filter(Vegetable.id == vegetable_id).first()
             if not vegetable:
                 logger.error(f"未找到ID为{vegetable_id}的蔬菜")
-                predictions_crud.update_model_training(
-                    db, training_id, 
-                    status="failed", 
-                    log=f"未找到ID为{vegetable_id}的蔬菜",
-                    end_time=datetime.now()
-                )
+                if training_id:
+                    predictions_crud.update_model_training(
+                        db, training_id, 
+                        status="failed", 
+                        log=f"未找到ID为{vegetable_id}的蔬菜",
+                        end_time=datetime.now()
+                    )
                 return {"success": False, "error": "未找到指定蔬菜"}
             
             training_data = ModelTrainingCreate(
-            algorithm="LSTM",
+                algorithm="LSTM",
                 status="running",
                 vegetable_id=vegetable_id,
                 product_name=vegetable.product_name,
                 history_days=history_days,
                 prediction_days=prediction_days,
-                sequence_length=sequence_length
+                sequence_length=sequence_length,
+                log="初始化训练环境..."
             )
             training_record = predictions_crud.create_model_training(db, training_data)
             training_id = training_record.id
@@ -227,242 +232,385 @@ def train_lstm_model(
         # 获取蔬菜信息
         vegetable = db.query(Vegetable).filter(Vegetable.id == vegetable_id).first()
         if not vegetable:
-            logger.error(f"未找到ID为{vegetable_id}的蔬菜")
+            error_msg = f"未找到ID为{vegetable_id}的蔬菜"
+            logger.error(error_msg)
             predictions_crud.update_model_training(
                 db, training_id, 
                 status="failed", 
-                log=f"未找到ID为{vegetable_id}的蔬菜",
+                log=error_msg,
                 end_time=datetime.now()
             )
-            return {"success": False, "error": "未找到指定蔬菜"}
+            return {"success": False, "error": error_msg}
         
-        # 获取价格数据 - 使用从2022年开始的数据
-        df = fetch_price_data(vegetable_id, db, days=history_days, from_2022=from_2022)
+        # 更新日志
+        safe_log_update(db, training_id, f"正在获取蔬菜 '{vegetable.product_name}' 的历史价格数据...")
         
-        # 检查数据是否足够
-        if len(df) < min_data_points:
-            logger.warning(f"蔬菜 '{vegetable.product_name}' 数据不足，仅有 {len(df)} 条记录，需要至少 {min_data_points} 条")
-            
-            # 更新训练记录
+        # 获取历史价格数据 - 基于蔬菜名称而不仅是ID
+        # 首先获取所有具有相同名称的蔬菜ID
+        same_name_vegetables = db.query(Vegetable).filter(
+            Vegetable.product_name == vegetable.product_name
+        ).all()
+        
+        vegetable_ids = [v.id for v in same_name_vegetables]
+        
+        if not vegetable_ids:
+            vegetable_ids = [vegetable_id]  # 如果没有找到相同名称的蔬菜，则使用当前ID
+        
+        # 基于所有相同名称的蔬菜ID获取价格记录
+        safe_log_update(db, training_id, f"找到 {len(vegetable_ids)} 个相同名称的蔬菜记录，ID: {vegetable_ids}")
+        
+        # 构建查询
+        history_prices_query = db.query(PriceRecord).filter(
+            PriceRecord.vegetable_id.in_(vegetable_ids)
+        )
+        
+        if from_2022:
+            history_prices_query = history_prices_query.filter(PriceRecord.price_date >= datetime(2022, 1, 1))
+        else:
+            # 仅获取指定天数的历史数据
+            if history_days > 0:
+                start_date = datetime.now() - timedelta(days=history_days)
+                history_prices_query = history_prices_query.filter(PriceRecord.price_date >= start_date)
+        
+        # 获取所有价格记录并按日期排序
+        history_prices = history_prices_query.order_by(
+            PriceRecord.price_date.asc()
+        ).all()
+        
+        if len(history_prices) < min_data_points:
+            error_msg = f"数据点数量不足，当前仅有{len(history_prices)}个，最小需要{min_data_points}个"
+            logger.warning(error_msg)
             predictions_crud.update_model_training(
                 db, training_id, 
                 status="failed", 
+                log=error_msg,
                 end_time=datetime.now()
             )
-            safe_log_update(db, training_id, f"\n数据不足，仅有 {len(df)} 条记录，需要至少 {min_data_points} 条")
-            return {"success": False, "error": f"历史数据不足，需要至少 {min_data_points} 天的数据"}
+            return {"success": False, "error": error_msg}
         
-        # 动态设置序列长度，最少7天，最多30天，或者数据长度的一半
-        optimal_sequence_length = min(30, max(7, len(df) // 2))
-        if sequence_length is None or sequence_length > len(df) - 1:
-            sequence_length = optimal_sequence_length
-            logger.info(f"自动设置序列长度为 {sequence_length}")
+        safe_log_update(db, training_id, f"成功获取{len(history_prices)}条历史价格数据，开始预处理...")
         
-        # 更新训练记录
-        data_period = f"从 {df['price_date'].min()} 到 {df['price_date'].max()}"
-        safe_log_update(db, training_id, f"开始训练模型，数据点数: {len(df)}，序列长度: {sequence_length}，数据期间: {data_period}")
+        # 准备数据集 - 需要处理可能的重复日期问题
+        # 按日期分组并计算每天的平均价格
+        price_data = {}
+        for p in history_prices:
+            date_key = p.price_date.strftime('%Y-%m-%d')
+            if date_key not in price_data:
+                price_data[date_key] = {'date': p.price_date, 'prices': []}
+            price_data[date_key]['prices'].append(p.price)
         
-        # 准备训练数据
-        X, y, scaler = prepare_lstm_data(df, sequence_length)
+        # 计算每天的平均价格
+        dates = []
+        prices = []
+        for date_key, data in sorted(price_data.items()):
+            dates.append(data['date'])
+            # 计算该日期的平均价格
+            avg_price = sum(data['prices']) / len(data['prices'])
+            prices.append(avg_price)
         
-        # 创建DataLoader
-        batch_size = min(32, len(X))
-        dataloader = create_data_loader(X, y, batch_size=batch_size)
+        safe_log_update(db, training_id, f"数据预处理：按日期合并后共有{len(dates)}个唯一数据点")
         
-        # 定义模型参数
-        input_size = 1
-        hidden_layer_size = 50
-        output_size = 1
-        num_layers = 2
-        dropout = 0.2
+        # 创建DataFrame
+        df = pd.DataFrame({
+            'date': dates,
+            'price': prices
+        })
         
-        # 创建模型实例
+        # 设置日期为索引
+        df['date'] = pd.to_datetime(df['date'])
+        df.set_index('date', inplace=True)
+        
+        # 数据规范化
+        scaler = MinMaxScaler(feature_range=(0, 1))
+        scaled_data = scaler.fit_transform(df[['price']])
+        
+        # 创建序列数据
+        X = []
+        y = []
+        
+        for i in range(len(scaled_data) - sequence_length):
+            X.append(scaled_data[i:i+sequence_length])
+            y.append(scaled_data[i+sequence_length])
+        
+        # 转换为numpy数组
+        X = np.array(X)
+        y = np.array(y)
+        
+        # 确保数据量充足
+        if len(X) < 10:  # 小于10个样本时无法有效训练
+            error_msg = f"处理后的数据点数量不足以进行训练，当前仅有{len(X)}个样本"
+            logger.warning(error_msg)
+            predictions_crud.update_model_training(
+                db, training_id, 
+                status="failed", 
+                log=error_msg,
+                end_time=datetime.now()
+            )
+            return {"success": False, "error": error_msg}
+        
+        # 划分训练集和测试集
+        train_size = int(len(X) * 0.8)
+        X_train, X_test = X[:train_size], X[train_size:]
+        y_train, y_test = y[:train_size], y[train_size:]
+        
+        safe_log_update(db, training_id, f"数据预处理完成，训练集样本数: {len(X_train)}，测试集样本数: {len(X_test)}")
+        
+        # 转换为PyTorch张量
+        X_train = torch.FloatTensor(X_train)
+        y_train = torch.FloatTensor(y_train)
+        X_test = torch.FloatTensor(X_test)
+        y_test = torch.FloatTensor(y_test)
+        
+        # 创建数据加载器
+        train_dataset = torch.utils.data.TensorDataset(X_train, y_train)
+        test_dataset = torch.utils.data.TensorDataset(X_test, y_test)
+        
+        batch_size = min(32, len(X_train))
+        dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        
+        # 使用已定义的LSTMModel类
+        # 设置模型参数
+        input_size = 1  # 输入特征维度
+        hidden_layer_size = 64  # 隐藏层维度
+        output_size = 1  # 输出维度
+        num_layers = 2  # LSTM层数
+        dropout = 0.2  # Dropout率
+        
+        # 初始化模型
         model = LSTMModel(
-            input_size=input_size, 
-            hidden_layer_size=hidden_layer_size, 
-            output_size=output_size, 
+            input_size=input_size,
+            hidden_layer_size=hidden_layer_size,
+            output_size=output_size,
             num_layers=num_layers,
             dropout=dropout
         )
         
-        # 损失函数和优化器
+        try:
+            # 检查是否有CUDA可用
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            model = model.to(device)
+            X_train = X_train.to(device)
+            y_train = y_train.to(device)
+            X_test = X_test.to(device)
+            y_test = y_test.to(device)
+            safe_log_update(db, training_id, f"使用设备: {device}")
+        except Exception as e:
+            # 如果CUDA初始化失败，回退到CPU
+            device = torch.device('cpu')
+            model = model.to(device)
+            X_train = X_train.to(device)
+            y_train = y_train.to(device)
+            X_test = X_test.to(device)
+            y_test = y_test.to(device)
+            safe_log_update(db, training_id, f"CUDA初始化失败，使用CPU: {str(e)}")
+        
+        # 定义损失函数和优化器
         criterion = nn.MSELoss()
         optimizer = optim.Adam(model.parameters(), lr=0.001)
         
-        # 训练模型
-        epochs = 100
-        
-        # 记录训练进度
-        train_log = f"开始训练LSTM模型，数据点数: {len(X)}，序列长度: {sequence_length}，轮次: {epochs}，数据期间: {data_period}"
-        safe_log_update(db, training_id, train_log)
-        
-        # 训练循环
+        # 设置早停参数
+        patience = 20  # 如果20个epoch内验证损失没有改善，则停止训练
         best_loss = float('inf')
-        patience = 10
         patience_counter = 0
+        best_model_state = None
         
-        for epoch in range(epochs):
-            model.train()
-            total_loss = 0
-            
-            for X_batch, y_batch in dataloader:
-                # 将数据转换为模型所需的形状 [batch_size, seq_length, feature_dimension]
-                X_batch = X_batch.view(X_batch.shape[0], X_batch.shape[1], 1)
+        # 设置训练参数
+        epochs = 200  # 最大训练轮次
+        
+        safe_log_update(db, training_id, f"开始训练LSTM模型，最大轮次: {epochs}，早停耐心值: {patience}")
+        safe_log_update(db, training_id, f"模型结构: 输入维度={input_size}, 隐藏层维度={hidden_layer_size}, LSTM层数={num_layers}, 输出维度={output_size}")
+        
+        # 训练模型
+        model.train()
+        
+        try:
+            for epoch in range(epochs):
+                model.train()
+                total_loss = 0
                 
-                # 反向传播和优化
-                optimizer.zero_grad()
+                for X_batch, y_batch in dataloader:
+                    X_batch = X_batch.to(device)
+                    y_batch = y_batch.to(device)
+                    
+                    # 将数据转换为模型所需的形状 [batch_size, seq_length, feature_dimension]
+                    X_batch = X_batch.view(X_batch.shape[0], X_batch.shape[1], 1)
+                    
+                    # 反向传播和优化
+                    optimizer.zero_grad()
+                    
+                    # 前向传播
+                    outputs = model(X_batch)
+                    loss = criterion(outputs, y_batch)
                 
-                # 前向传播
-                outputs = model(X_batch)
-                loss = criterion(outputs, y_batch)
-            
-                # 反向传播
-            loss.backward()
-            optimizer.step()
-            
-            total_loss += loss.item() * X_batch.size(0)
+                    # 反向传播
+                    loss.backward()
+                    optimizer.step()
                 
-            # 计算平均损失
-            epoch_loss = total_loss / len(X)
-            
-            # 早停策略
-            if epoch_loss < best_loss:
-                best_loss = epoch_loss
-                patience_counter = 0
-                best_model_state = model.state_dict()
-            else:
-                patience_counter += 1
-            
-            if (epoch+1) % 10 == 0 or patience_counter >= patience:
-                log_message = f"\nEpoch [{epoch+1}/{epochs}], Loss: {epoch_loss:.6f}"
-                safe_log_update(db, training_id, log_message)
+                    total_loss += loss.item() * X_batch.size(0)
+                    
+                # 计算平均损失
+                epoch_loss = total_loss / len(X_train)
                 
-            if patience_counter >= patience:
-                log_message = f"\n提前停止训练，轮次 {epoch+1}/{epochs}"
-                safe_log_update(db, training_id, log_message)
-                break
-        
-        # 加载最佳模型
-        model.load_state_dict(best_model_state)
-        
-        # 保存模型
-        sanitized_name = vegetable.product_name.replace(' ', '_').replace('/', '_').replace('\\', '_')
-        model_filename = f"lstm_vegetable_{vegetable_id}_{sanitized_name}.pth"
-        model_path = os.path.join(MODEL_DIR, model_filename)
-        torch.save({
-            'model_state_dict': model.state_dict(),
-            'input_size': input_size,
-            'hidden_layer_size': hidden_layer_size,
-            'output_size': output_size,
-            'num_layers': num_layers,
-            'dropout': dropout,
-            'sequence_length': sequence_length,
-            'scaler': scaler,
-            'last_trained': datetime.now().isoformat(),
-            'data_start_date': df['price_date'].min().strftime('%Y-%m-%d'),
-            'data_end_date': df['price_date'].max().strftime('%Y-%m-%d'),
-            'data_points': len(df),
-            'vegetable_name': vegetable.product_name
-        }, model_path)
-        
-        # 预测未来价格
-        future_predictions = predict_future_prices(
-            model=model,
-            last_sequence=X[-1],
-            scaler=scaler,
-            days=prediction_days
-        )
-        
-        # 将预测结果保存到数据库
-        start_date = df['price_date'].iloc[-1] + timedelta(days=1)
-        for i, price in enumerate(future_predictions):
-            pred_date = start_date + timedelta(days=i)
+                # 计算验证损失
+                model.eval()
+                with torch.no_grad():
+                    X_test_reshaped = X_test.view(X_test.shape[0], X_test.shape[1], 1)
+                    test_outputs = model(X_test_reshaped)
+                    val_loss = criterion(test_outputs, y_test).item()
+                
+                # 早停策略
+                if val_loss < best_loss:
+                    best_loss = val_loss
+                    patience_counter = 0
+                    best_model_state = model.state_dict()
+                else:
+                    patience_counter += 1
+                
+                # 记录日志
+                if (epoch+1) % 5 == 0 or patience_counter >= patience or epoch == 0 or epoch == epochs-1:
+                    log_message = f"\nEpoch [{epoch+1}/{epochs}], 训练损失: {epoch_loss:.6f}, 验证损失: {val_loss:.6f}"
+                    safe_log_update(db, training_id, log_message)
+                
+                # 检查是否需要提前停止
+                if patience_counter >= patience:
+                    log_message = f"\n提前停止训练: 验证损失{patience}轮未改善，当前轮次 {epoch+1}/{epochs}"
+                    safe_log_update(db, training_id, log_message)
+                    break
+                
+                # 每10轮检查一次训练记录状态，确保任务未被取消
+                if (epoch+1) % 10 == 0:
+                    # 检查训练记录状态
+                    updated_record = predictions_crud.get_model_training(db, training_id)
+                    if updated_record.status != "running":
+                        log_message = f"\n训练被用户中断，状态: {updated_record.status}"
+                        safe_log_update(db, training_id, log_message)
+                        return {"success": False, "error": "训练被中断"}
             
-            # 准备预测记录
-            prediction_data = PredictionCreate(
-                vegetable_id=vegetable_id,
-                predicted_date=pred_date,
-                predicted_price=float(price),
-                algorithm="LSTM"
-            )
+            # 加载最佳模型
+            model.load_state_dict(best_model_state)
             
-            # 创建预测记录
-            predictions_crud.create_prediction(db, prediction_data)
-        
-        # 评估模型性能（如果有足够的数据进行验证）
-        if len(X) >= 10:  # 至少需要10个数据点进行简单评估
-            # 简单的训练集评估
+            # 保存模型 - 确保文件名表明这是基于产品名称的模型
+            sanitized_name = vegetable.product_name.replace(' ', '_').replace('/', '_').replace('\\', '_')
+            model_filename = f"lstm_product_{sanitized_name}.pth"
+            model_path = os.path.join(MODEL_DIR, model_filename)
+            
+            # 移动模型回CPU再保存
+            model = model.to(torch.device('cpu'))
+            
+            # 检查状态字典中的键名是否需要重命名（比如将'linear.'重命名为'fc.'以保持一致性）
+            state_dict = model.state_dict()
+            standardized_state_dict = state_dict
+            
+            # 保存模型，包含更多关于训练数据的信息
+            torch.save({
+                'model_state_dict': standardized_state_dict,
+                'input_size': input_size,  # 使用与加载部分一致的变量名
+                'hidden_layer_size': hidden_layer_size,  # 使用与加载部分一致的变量名
+                'output_size': output_size,  # 使用与加载部分一致的变量名
+                'num_layers': num_layers,
+                'scaler': scaler,
+                'product_name': vegetable.product_name,
+                'vegetable_id': vegetable_id,
+                'included_vegetable_ids': vegetable_ids,
+                'training_date': datetime.now().isoformat(),
+                'data_points': len(history_prices),
+                'unique_dates': len(dates),
+                'date_range': f"{min(dates).strftime('%Y-%m-%d')} to {max(dates).strftime('%Y-%m-%d')}"
+            }, model_path)
+            
+            # 模型评估
             model.eval()
             with torch.no_grad():
-                X_tensor = torch.FloatTensor(X).view(X.shape[0], X.shape[1], 1)
-                y_pred = model(X_tensor).numpy()
-                y_true = y
+                # 所有测试数据的预测
+                X_test_cpu = X_test.to(torch.device('cpu'))
+                X_test_reshaped = X_test_cpu.view(X_test_cpu.shape[0], X_test_cpu.shape[1], 1)
+                test_predictions = model(X_test_reshaped).numpy()
                 
-                # 转换回原始价格
-                y_pred_orig = scaler.inverse_transform(y_pred)
-                y_true_orig = scaler.inverse_transform(y_true)
+                # 反归一化
+                test_predictions = scaler.inverse_transform(test_predictions)
+                y_test_actual = scaler.inverse_transform(y_test.cpu().numpy().reshape(-1, 1))
                 
                 # 计算评估指标
-                mae = np.mean(np.abs(y_pred_orig - y_true_orig))
-                mse = np.mean((y_pred_orig - y_true_orig) ** 2)
-                rmse = np.sqrt(mse)
+                mse = mean_squared_error(y_test_actual, test_predictions)
+                mae = mean_absolute_error(y_test_actual, test_predictions)
+                r2 = r2_score(y_test_actual, test_predictions)
                 
-                # 计算R²: 1 - (误差平方和 / 总变异)
-                ss_tot = np.sum((y_true_orig - np.mean(y_true_orig)) ** 2)
-                ss_res = np.sum((y_true_orig - y_pred_orig) ** 2)
-                r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
+                # 计算预测准确率 (预测价格与实际价格的百分比偏差)
+                accuracy_threshold = 0.15  # 15%偏差内认为是准确的
+                accurate_predictions = 0
                 
-                # 计算预测准确率（基于相对误差）
-                relative_errors = np.abs(y_pred_orig - y_true_orig) / y_true_orig
-                accuracy = np.mean(relative_errors < 0.1)  # 相对误差<10%视为准确
+                for i in range(len(test_predictions)):
+                    actual = y_test_actual[i][0]
+                    predicted = test_predictions[i][0]
+                    percent_error = abs(actual - predicted) / actual if actual != 0 else 1
+                    
+                    if percent_error <= accuracy_threshold:
+                        accurate_predictions += 1
                 
-                # 创建评估记录
-                evaluation = ModelEvaluationCreate(
+                prediction_accuracy = accurate_predictions / len(test_predictions) if len(test_predictions) > 0 else 0
+                
+                # 创建并保存评估记录
+                evaluation_data = ModelEvaluationCreate(
                     model_id=training_id,
                     algorithm="LSTM",
-                    vegetable_id=vegetable_id,
-                    product_name=vegetable.product_name,
                     mean_absolute_error=float(mae),
                     mean_squared_error=float(mse),
                     r_squared=float(r2),
-                    prediction_accuracy=float(accuracy)
+                    prediction_accuracy=float(prediction_accuracy),
+                    vegetable_id=vegetable_id,
+                    product_name=vegetable.product_name
                 )
                 
-                predictions_crud.create_model_evaluation(db=db, evaluation=evaluation)
+                evaluation = predictions_crud.create_model_evaluation(db, evaluation_data)
                 
-                # 更新训练记录日志
-                eval_log = f"\n模型评估结果：\nMAE: {mae:.4f}, MSE: {mse:.4f}, RMSE: {rmse:.4f}\nR²: {r2:.4f}, 准确率: {accuracy*100:.2f}%"
+                # 更新训练记录为完成状态
+                predictions_crud.update_model_training(
+                    db, training_id, 
+                    status="completed", 
+                    end_time=datetime.now()
+                )
+                
+                # 记录最终评估结果
+                eval_log = f"\n训练完成，模型评估结果:\n"
+                eval_log += f"均方误差 (MSE): {mse:.4f}\n"
+                eval_log += f"平均绝对误差 (MAE): {mae:.4f}\n"
+                eval_log += f"决定系数 (R²): {r2:.4f}\n"
+                eval_log += f"预测准确率: {prediction_accuracy*100:.2f}%\n"
+                eval_log += f"模型保存路径: {model_path}"
+                
                 safe_log_update(db, training_id, eval_log)
-            
-            # 更新训练记录
-        final_log = f"\n模型训练完成并预测未来{prediction_days}天价格"
-        safe_log_update(db, training_id, final_log)
-        predictions_crud.update_model_training(
-            db, training_id, 
-            status="completed", 
-            end_time=datetime.now()
-        )
-        
-        # 返回结果
-        return {
-            "success": True,
-            "training_id": training_id,
-            "vegetable_name": vegetable.product_name,
-            "model_path": model_path,
-            "data_points": len(df),
-            "date_range": f"{df['price_date'].min()} - {df['price_date'].max()}",
-            "predictions": [{"date": (start_date + timedelta(days=i)).isoformat(), "price": float(price)} 
-                               for i, price in enumerate(future_predictions)]
-                               }
-            
-    except Exception as e:
-        logger.error(f"训练模型时出错: {str(e)}")
-        if training_id:
-            error_msg = f"训练失败: {str(e)}"
-            safe_log_update(db, training_id, f"\n{error_msg}")
+                
+                # 返回结果
+                return {
+                    "success": True,
+                    "model_path": model_path,
+                    "evaluation": {
+                        "id": evaluation.id,
+                        "mse": float(mse),
+                        "mae": float(mae),
+                        "r2": float(r2),
+                        "accuracy": float(prediction_accuracy)
+                    }
+                }
+        except Exception as e:
+            error_msg = f"训练过程中出错: {str(e)}\n{traceback.format_exc()}"
+            logger.error(error_msg)
             predictions_crud.update_model_training(
                 db, training_id, 
                 status="failed", 
+                log=f"{training_record.log}\n{error_msg}",
+                end_time=datetime.now()
+            )
+            return {"success": False, "error": str(e)}
+            
+    except Exception as e:
+        error_msg = f"模型训练初始化失败: {str(e)}\n{traceback.format_exc()}"
+        logger.error(error_msg)
+        if training_id:
+            predictions_crud.update_model_training(
+                db, training_id, 
+                status="failed", 
+                log=error_msg,
                 end_time=datetime.now()
             )
         return {"success": False, "error": str(e)}
@@ -481,8 +629,16 @@ def predict_future_prices(model: LSTMModel, last_sequence: np.ndarray, scaler: M
     """
     model.eval()
     
-    # 转换为PyTorch张量并调整形状
-    current_batch = torch.FloatTensor(last_sequence.reshape(1, -1, 1))
+    # 检查last_sequence是否已经是3D张量
+    if len(last_sequence.shape) == 1:
+        # 如果是1D数组，转换为3D: [batch_size, sequence_length, feature_dim]
+        current_batch = torch.FloatTensor(last_sequence).reshape(1, -1, 1)
+    elif len(last_sequence.shape) == 2:
+        # 如果是2D数组，增加特征维度: [batch_size, sequence_length, feature_dim]
+        current_batch = torch.FloatTensor(last_sequence).reshape(1, last_sequence.shape[0], 1)
+    else:
+        # 假设已经是正确的3D张量形状
+        current_batch = torch.FloatTensor(last_sequence)
     
     # 初始化预测列表
     predictions = []
@@ -543,7 +699,7 @@ def predict_vegetable_price(vegetable_id: int, db: Session, days: int = 7, use_s
         
         # 检查是否有保存的模型
         sanitized_name = vegetable.product_name.replace(' ', '_').replace('/', '_').replace('\\', '_')
-        model_filename = f"lstm_vegetable_{vegetable_id}_{sanitized_name}.pth"
+        model_filename = f"lstm_product_{sanitized_name}.pth"
         model_path = os.path.join(MODEL_DIR, model_filename)
         
         # 如果没有找到精确匹配的模型文件，尝试查找同名蔬菜的模型
@@ -583,36 +739,99 @@ def predict_vegetable_price(vegetable_id: int, db: Session, days: int = 7, use_s
             # 加载保存的模型
             checkpoint = torch.load(model_path)
             
-            # 获取模型参数
-            input_size = checkpoint.get('input_size', 1)
-            hidden_layer_size = checkpoint.get('hidden_layer_size', 50)
-            output_size = checkpoint.get('output_size', 1)
-            num_layers = checkpoint.get('num_layers', 2)
-            dropout = checkpoint.get('dropout', 0.2)
-            sequence_length = checkpoint.get('sequence_length', optimal_sequence_length)
+            # 获取模型参数 - 处理新格式和旧格式
+            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                # 新格式 - 完整的字典包含额外信息
+                input_dim = checkpoint.get('input_size', 1)
+                hidden_dim = checkpoint.get('hidden_layer_size', 64)
+                output_dim = checkpoint.get('output_size', 1)
+                num_layers = checkpoint.get('num_layers', 2)
+                
+                # 记录模型训练数据信息
+                product_name = checkpoint.get('product_name', vegetable.product_name)
+                training_date = checkpoint.get('training_date', 'unknown')
+                date_range = checkpoint.get('date_range', 'unknown')
+                data_points = checkpoint.get('data_points', 'unknown')
+                
+                logger.info(f"使用已训练的产品'{product_name}'模型，训练日期={training_date}，数据点数={data_points}，日期范围={date_range}")
+                
+                # 重建模型
+                model = LSTMModel(
+                    input_size=input_dim, 
+                    hidden_layer_size=hidden_dim, 
+                    output_size=output_dim, 
+                    num_layers=num_layers
+                )
+                
+                # 处理键名不匹配的情况 (fc -> linear)
+                state_dict = checkpoint['model_state_dict']
+                
+                # 检查是否需要处理键名不匹配的问题
+                # 检查state_dict是否有fc层相关的键
+                has_fc_keys = any(key.startswith('fc.') for key in state_dict.keys())
+                
+                if has_fc_keys:
+                    # 需要重命名键
+                    new_state_dict = {}
+                    for key in state_dict:
+                        if key.startswith('fc.'):
+                            new_key = key.replace('fc.', 'linear.')
+                            new_state_dict[new_key] = state_dict[key]
+                        else:
+                            new_state_dict[key] = state_dict[key]
+                    model.load_state_dict(new_state_dict)
+                else:
+                    # 直接加载
+                    model.load_state_dict(state_dict)
+                
+                # 获取缩放器
+                scaler = checkpoint['scaler']
+            else:
+                # 旧格式 - 直接是模型状态字典
+                input_dim = 1
+                hidden_dim = 64
+                output_dim = 1
+                num_layers = 2
+                
+                # 记录使用默认参数
+                logger.info(f"使用旧格式的模型，使用默认参数")
+                
+                # 创建LSTM模型
+                model = LSTMModel(
+                    input_size=input_dim, 
+                    hidden_layer_size=hidden_dim, 
+                    output_size=output_dim, 
+                    num_layers=num_layers
+                )
+                
+                # 检查是否需要处理键名不匹配的问题
+                # 检查checkpoint是否有fc层相关的键
+                has_fc_keys = any(key.startswith('fc.') for key in checkpoint.keys())
+                
+                if has_fc_keys:
+                    # 需要重命名键
+                    new_state_dict = {}
+                    for key in checkpoint:
+                        if key.startswith('fc.'):
+                            new_key = key.replace('fc.', 'linear.')
+                            new_state_dict[new_key] = checkpoint[key]
+                        else:
+                            new_state_dict[key] = checkpoint[key]
+                    model.load_state_dict(new_state_dict)
+                else:
+                    # 直接加载
+                    model.load_state_dict(checkpoint)
+                
+                # 创建一个新的缩放器
+                scaler = MinMaxScaler(feature_range=(0, 1))
+                # 使用历史数据拟合缩放器
+                if len(df) > 0:
+                    scaler.fit(df[['price']].values)
             
-            # 记录模型训练数据信息
-            data_start_date = checkpoint.get('data_start_date', 'unknown')
-            data_end_date = checkpoint.get('data_end_date', 'unknown')
-            data_points = checkpoint.get('data_points', 'unknown')
-            
-            logger.info(f"使用已训练的模型，序列长度={sequence_length}，训练数据点数={data_points}，日期范围={data_start_date} 到 {data_end_date}")
-            
-            # 重建模型
-            model = LSTMModel(
-                input_size=input_size, 
-                hidden_layer_size=hidden_layer_size, 
-                output_size=output_size, 
-                num_layers=num_layers,
-                dropout=dropout
-            )
-            model.load_state_dict(checkpoint['model_state_dict'])
             model.eval()
             
-            # 获取缩放器
-            scaler = checkpoint['scaler']
-            
-            # 准备预测数据
+            # 准备预测数据的序列长度
+            sequence_length = checkpoint.get('sequence_length', optimal_sequence_length)
             if len(df) < sequence_length:
                 logger.warning(f"数据点数不足 {len(df)}/{sequence_length}，使用可用的最大序列长度")
                 sequence_length = max(7, len(df) - 1)
